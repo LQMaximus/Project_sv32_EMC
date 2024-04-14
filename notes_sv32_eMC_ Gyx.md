@@ -40,3 +40,45 @@ These relationships are correct after being checked.
 ## The Distribution of the Conditional Integrated Variance
 
 ![image-20240408215935658](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240408215935658.png)
+
+Using $A(t) = \frac{4t}{\epsilon^2}$, we can get
+
+![image-20240411201554543](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411201554543.png)
+
+To develop a formula for
+
+$$E(exp\{-a\int_0^t\frac{ds}{X_s}\}|X_t, X_u)$$
+
+To eliminate the random component of the drift term,
+
+![image-20240411202037279](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411202037279.png)
+
+![image-20240411205906014](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411205906014.png)
+
+For 3.3
+
+![image-20240411205934279](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411205934279.png)
+
+For 3.2
+
+![image-20240411210019428](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411210019428.png)
+
+![image-20240411210044090](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411210044090.png)
+
+这里相当于把条件期望乘以转移密度看作是 一个转移密度，在引用【5】的对应地方有
+
+![image-20240411210222779](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411210222779.png)
+
+最后可以得到
+
+![image-20240411210801228](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411210801228.png)
+
+## Implementation
+
+![image-20240411224115154](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411224115154.png)
+
+![image-20240411224144601](C:\Users\27261\AppData\Roaming\Typora\typora-user-images\image-20240411224144601.png)
+
+## Variance Reduction Techniques
+
+quasi-Monte Carlo
