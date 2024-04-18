@@ -4,7 +4,7 @@
 from .heston_mixture import HestonMixture
 from .sv32_mc2 import Sv32McTimeStep, Sv32McBaldeaux2012Exact, Sv32McChoiKwok2023Ig
 from .subord_bm import VarGammaQuad, ExpNigQuad
-from .sv_fft import RoughHestonFft
+from .sv_fft import RoughHestonFft, Sv32Fft
 
 # SABR / OUSV models for research
 from .sabr_int import SabrMixture
