@@ -451,9 +451,11 @@ class Sv32McChoiKwok2023Ig(Sv32McBaldeaux2012Exact):
         Returns:
             (var_t, avgvar)
         """
-        self.gist = "ig"
-        # var_t, _ = self._m_heston.var_step_pois_gamma(1/var_0, dt)
-        var_t = self._m_heston.var_step_ncx2(dt, 1/var_0)
+        if self.dist ==  "ig":
+            var_t = self._m_heston.var_step_ncx2(dt, 1/var_0)
+        elif self.dist == "ga":
+            var_t, _ = self._m_heston.var_step_pois_gamma(1/var_0, dt)
+        
         np.divide(1.0, var_t, out=var_t)
         m1, var = self.cond_avgvar_mv_numeric(dt, var_0, var_t)
         avgvar = self.draw_from_mv(m1, var, self.dist)
