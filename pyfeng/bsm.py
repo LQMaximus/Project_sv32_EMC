@@ -1,11 +1,12 @@
 import numpy as np
 import scipy.stats as spst
+import scipy.optimize as spopt
 import warnings
 
 from . import opt_abc as opt
 from . import norm
 from . import opt_smile_abc as smile
-
+from .util import MathFuncs, MathConsts
 
 class Bsm(opt.OptAnalyticABC):
     """
@@ -48,7 +49,7 @@ class Bsm(opt.OptAnalyticABC):
         disc_fac = np.exp(-texp*intr)
         fwd = np.array(spot)*(1.0 if is_fwd else np.exp(-texp*divr)/disc_fac)
 
-        sigma_std = np.maximum(np.array(sigma)*np.sqrt(texp), np.finfo(float).eps)
+        sigma_std = np.maximum(np.array(sigma)*np.sqrt(texp), np.finfo(float).tiny)
 
         # don't directly compute d1 just in case sigma_std is infty
         d1 = np.log(fwd/strike)/sigma_std
@@ -56,20 +57,144 @@ class Bsm(opt.OptAnalyticABC):
         d1 += 0.5*sigma_std
 
         cp = np.array(cp)
-        price = fwd*spst.norm.cdf(cp*d1) - strike*spst.norm.cdf(cp*d2)
+        price = fwd*spst.norm._cdf(cp*d1) - strike*spst.norm._cdf(cp*d2)
         price *= cp*disc_fac
         return price
+
+    @staticmethod
+    def d1sigma(d1, logk):
+        sig = np.array(np.sqrt(d1**2 + 2*logk) + np.abs(d1))
+        np.divide(2*logk, sig, out=sig, where=d1 < 0.)
+        return sig
+
+    @staticmethod
+    def vega_std(sigma, logk):
+        """
+        Standardized Vega
+
+        Args:
+            sigma: volatility
+            logk: log strike
+
+        Returns:
+
+        """
+        # don't directly compute d1 just in case sigma_std is infty
+        # handle the case logk = sigma = 0 (ATM)
+        d1 = np.where(logk == 0., 0., -logk/sigma)
+        d1 += 0.5*sigma
+        vega = spst.norm._pdf(d1)
+        return vega
+
+    @staticmethod
+    def price_vega_std(sigma, logk, sign=1, price=False):
+        """
+        Price-to-vega pv.
+            Option Price / Vega = (N(d1) - k N(d2))/n(d1) = R(-d1) - R(-d2) for sign = 1
+            (1 - Option Price) / Vega = (1 - N(d1) + k N(d2))/n(d1) = R(d1) + R(-d2) for sign = -1
+        where R(x) = N(-x)/n(x) is Mills pv
+
+        Args:
+            sigma: volatility
+            logk: log strike
+            sign: -1 for complementary price. +1 by default
+            price: multiply vega so return price if True. False by default
+
+        References:
+            Choi J, Huh J, Su N (2023) Tighter “Uniform Bounds for Black-Scholes Implied Volatility” and the applications to root-finding
+
+        Returns:
+
+        """
+        # don't directly compute d1 just in case sigma_std is infty
+        # handle the case logk = sigma = 0 (ATM)
+        d0 = np.array(np.where(logk == 0., 0., -logk/sigma))
+        sigma = np.broadcast_to(sigma, d0.shape)
+        pv = np.array(MathFuncs.mills_ratio(-sign*(d0 + sigma/2.)) - sign*MathFuncs.mills_ratio(-d0 + sigma/2.))
+
+        ## Correct pv values for very small sigma/d0
+        idx = (sigma/np.fmax(1.0, -d0) < 1e-3) & (sign > 0)
+        if np.any(idx):
+            sig_idx = sigma[idx]
+            d0_idx = d0[idx]
+            # Mills ratio derivative:
+            # R'(x) = x R(x) - 1
+            # -R'(-x) = x R(-x) + 1
+            # R'''(x) = x(x^2 + 3) R(x) - (x^2 + 2) = (x^2 + 3) R'(x) + 1
+            # -R'''(-x) = (x^2 + 3) -R'(-x) - 1
+
+            R_d1 = 1. + d0_idx * MathFuncs.mills_ratio(-d0_idx)
+            # when d0_idx is large negative
+            # R_d1 = 1./(d0_idx**2 + 2.)*(1. - 1./(d0_idx**2 + 4.)*(1. - 5./(d0_idx**2 + 6.))),
+
+            R_d3 = (d0_idx**2 + 3.)*R_d1 - 1.
+            # next term is sig_idx**4/1920 * R_d5
+            pv[idx] = (R_d1 + sig_idx**2/24.*R_d3)*sig_idx
+
+        if price:
+            pv *= spst.norm._pdf(d0 + sigma/2.)
+
+        return pv
+
+    @staticmethod
+    def price_delta_std(sigma, logk):
+        """
+        Price-to-delta ratio, 1 - R(-d2)/R(-d1) for Mills ratio R(x) = N(-x)/n(x).
+        It's used in calculating upper/lower bound of IV in Choi et al. (2023)
+
+        Args:
+            sigma: volatility
+            logk: log strike
+
+        Returns:
+
+        References:
+            Choi J, Huh J, Su N (2023) Tighter “Uniform Bounds for Black-Scholes Implied Volatility” and the applications to root-finding
+        """
+
+        # don't directly compute d1 just in case sigma_std is infty
+        # handle the case logk = sigma = 0 (ATM)
+        d0 = np.where(logk == 0., 0., -logk/sigma)
+        ratio = 1.0 - MathFuncs.mills_ratio(-d0 + sigma/2.) / MathFuncs.mills_ratio(-d0 - sigma/2.)
+
+        return ratio
 
     def vega(self, strike, spot, texp, cp=1):
 
         fwd, df, _ = self._fwd_factor(spot, texp)
 
-        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).eps)
-        d1 = np.log(fwd/strike)/sigma_std + 0.5*sigma_std
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).tiny)
+        d1 = np.log(fwd/strike)/sigma_std
+        d1 += 0.5*sigma_std
 
         # formula according to wikipedia
-        vega = df*fwd*spst.norm.pdf(d1)*np.sqrt(texp)
+        vega = df*fwd*spst.norm._pdf(d1)*np.sqrt(texp)
         return vega
+
+    def vega2(self, strike, spot, texp, cp=1):
+        """
+        Second derivative w.r.t. sigma.
+
+        Args:
+            strike:
+            spot:
+            texp:
+            cp:
+
+        Returns:
+
+        """
+        fwd, df, _ = self._fwd_factor(spot, texp)
+
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).tiny)
+        d1 = np.log(fwd/strike)/sigma_std
+        d2 = d1 - 0.5*sigma_std
+        d1 += 0.5*sigma_std
+
+        # formula according to wikipedia
+        vega2 = df*fwd*spst.norm._pdf(d1)*np.sqrt(texp) * d1*d2/sigma_std
+        return vega2
+
 
     def d2_var(self, strike, spot, texp, cp=1):
         """
@@ -89,12 +214,12 @@ class Bsm(opt.OptAnalyticABC):
         """
         fwd, df, _ = self._fwd_factor(spot, texp)
 
-        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).eps)
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).tiny)
         d1 = np.log(fwd/strike)/sigma_std
         d2 = d1 - 0.5*sigma_std
         d1 += 0.5*sigma_std
 
-        risk = df*spot*np.sqrt(texp)*spst.norm.pdf(d1)*(d1*d2 - 1)/(4*self.sigma**3)
+        risk = df*spot*np.sqrt(texp)*spst.norm._pdf(d1)*(d1*d2 - 1)/(4*self.sigma**3)
 
         return risk
 
@@ -116,13 +241,12 @@ class Bsm(opt.OptAnalyticABC):
         """
         fwd, df, _ = self._fwd_factor(spot, texp)
 
-        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).eps)
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).tiny)
         d1 = np.log(fwd/strike)/sigma_std
         d2 = d1 - 0.5*sigma_std
         d1 += 0.5*sigma_std
 
-        risk = df*spot*np.sqrt(texp)*spst.norm.pdf(d1)\
-               *((d1*d2 - 1)*(d1*d2 - 3) - (d1**2 + d2**2))/(8*self.sigma**5)
+        risk = df*spot*np.sqrt(texp)*spst.norm._pdf(d1)*((d1*d2 - 1)*(d1*d2 - 3) - (d1**2 + d2**2))/(8*self.sigma**5)
 
         return risk
 
@@ -130,10 +254,11 @@ class Bsm(opt.OptAnalyticABC):
 
         fwd, df, divf = self._fwd_factor(spot, texp)
 
-        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).eps)
-        d1 = np.log(fwd/strike)/sigma_std + 0.5*sigma_std
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).tiny)
+        d1 = np.log(fwd/strike)/sigma_std
+        d1 += 0.5*sigma_std
 
-        delta = cp*spst.norm.cdf(cp*d1)  # formula according to wikipedia
+        delta = cp*spst.norm._cdf(cp*d1)  # formula according to wikipedia
         delta *= df if self.is_fwd else divf
         return delta
 
@@ -141,21 +266,21 @@ class Bsm(opt.OptAnalyticABC):
 
         fwd, df, divf = self._fwd_factor(spot, texp)
 
-        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).eps)
-        d2 = np.log(fwd/strike)/sigma_std - 0.5*sigma_std
-        cdf = spst.norm.cdf(cp*d2)  # formula according to wikipedia
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).tiny)
+        d2 = np.log(fwd/strike)/sigma_std
+        d2 -= 0.5*sigma_std
+        cdf = spst.norm._cdf(cp*d2)  # formula according to wikipedia
         return cdf
 
     def gamma(self, strike, spot, texp, cp=1):
 
         fwd, df, divf = self._fwd_factor(spot, texp)
 
-        sigma_std = np.maximum(self.sigma*np.sqrt(texp), 100*np.finfo(float).eps)
-        d1 = np.log(fwd/strike)/sigma_std + 0.5*sigma_std
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), 100*np.finfo(float).tiny)
+        d1 = np.log(fwd/strike)/sigma_std
+        d1 += 0.5*sigma_std
 
-        gamma = (
-                df*spst.norm.pdf(d1)/fwd/sigma_std
-        )  # formula according to wikipedia
+        gamma = df*spst.norm._pdf(d1)/fwd/sigma_std  # formula according to wikipedia
         if not self.is_fwd:
             gamma *= (divf/df)**2
         return gamma
@@ -164,21 +289,20 @@ class Bsm(opt.OptAnalyticABC):
 
         fwd, df, divf = self._fwd_factor(spot, texp)
 
-        sigma_std = np.maximum(self.sigma*np.sqrt(texp), 100*np.finfo(float).eps)
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), 100*np.finfo(float).tiny)
         d1 = np.log(fwd/strike)/sigma_std
         d2 = d1 - 0.5*sigma_std
         d1 += 0.5*sigma_std
 
         # still not perfect; need to consider the derivative w.r.t. divr and is_fwd = True
-        theta = -0.5*spst.norm.pdf(d1)*fwd*self.sigma/np.sqrt(
-            texp
-        ) - cp*self.intr*strike*spst.norm.cdf(cp*d2)
+        theta = -0.5*spst.norm._pdf(d1)*fwd*self.sigma/np.sqrt(texp) \
+                - cp*self.intr*strike*spst.norm._cdf(cp*d2)
         theta *= df
         return theta
 
-    def _impvol_newton(self, price, strike, spot, texp, cp=1, setval=False):
+    def impvol_naive(self, price, strike, spot, texp, cp=1, setval=False, n_iter=32):
         """
-        BSM implied volatility with Newton's method
+        BSM implied volatility with Newton's method.
 
         Args:
             price: option price
@@ -191,6 +315,7 @@ class Bsm(opt.OptAnalyticABC):
         Returns:
             implied volatility
         """
+
         fwd, df, divf = self._fwd_factor(spot, texp)
 
         strike_std = strike/fwd  # strike / fwd
@@ -204,21 +329,17 @@ class Bsm(opt.OptAnalyticABC):
 
         # Exclude optoin price below intrinsic value or above max value (1 for call or k for put)
         # ind_solve can be scalar or array. scalar can be fine in np.abs(p_err[ind_solve])
-        ind_solve = (price_std - p_min > Bsm.IMPVOL_TOL) & (
-                p_max - price_std > Bsm.IMPVOL_TOL
-        )
+        ind_solve = (price_std - p_min > Bsm.IMPVOL_TOL) & (p_max - price_std > Bsm.IMPVOL_TOL)
 
         # initial guess = inflection point in sigma (volga=0)
-        _sigma = np.ones_like(ind_solve)*np.sqrt(
-            2*np.abs(np.log(strike_std))/texp
-        )
+        _sigma = np.ones_like(ind_solve)*np.sqrt(2*np.abs(np.log(strike_std))/texp)
 
         bsm_model.sigma = _sigma
         p_err = bsm_model.price(strike_std, 1.0, texp, cp) - price_std
         # print(np.sign(p_err), _sigma)
 
         if np.any(ind_solve):
-            for k in range(32):  # usually iteration ends less than 10
+            for k in range(n_iter):  # usually iteration ends less than 10
                 vega = bsm_model.vega(strike_std, 1.0, texp, cp)
                 _sigma -= p_err/vega
                 bsm_model.sigma = _sigma
@@ -229,7 +350,7 @@ class Bsm(opt.OptAnalyticABC):
                 # ignore the error of the elements with ind_solve = False
                 if p_err_max < Bsm.IMPVOL_TOL:
                     break
-            # print(k)
+            #print(k)
 
             if p_err_max >= Bsm.IMPVOL_TOL:
                 warn_msg = f"impvol_newton did not converged within {k} iterations: max error = {p_err_max}"
@@ -253,17 +374,78 @@ class Bsm(opt.OptAnalyticABC):
         )
 
         if scalar_output:
-            _sigma = np.asscalar(_sigma)
+            _sigma = _sigma.item()
 
         if setval:
             self.sigma = _sigma
 
         return _sigma
 
-    #### Class method
-    impvol = _impvol_newton
 
-    def vol_smile(self, strike, spot, texp, cp=1, model="norm"):
+    def impvol_log(self, price, strike, spot, texp, cp=1, setval=False, n_iter=8):
+        """
+        BSM implied volatility with Newton's method with log price
+
+        Args:
+            price: option price
+            strike: strike price
+            spot: spot (or forward) price
+            texp: time to expiry
+            cp: 1/-1 for call/put option
+            setval: if True, sigma is set with the solved implied volatility
+
+        References:
+            Choi J, Huh J, Su N (2023) Tighter “Uniform Bounds for Black-Scholes Implied Volatility” and the applications to root-finding
+
+        Returns:
+            implied volatility
+        """
+
+        fwd, df, _ = self._fwd_factor(spot, texp)
+
+        # standardized strike and price
+        kk = np.array(strike/fwd)
+        np.reciprocal(kk, out=kk, where=kk < 1.)
+        p = (price/df - np.fmax(cp*(fwd - strike), 0.0)) / np.fmin(fwd, strike)
+
+        # Exclude option price out of bound
+        # ind_solve can be scalar or array. scalar can be fine in np.abs(p_err[ind_solve])
+        logk, p = np.broadcast_arrays(np.log(kk), p)
+
+        sigma = np.where(
+            (logk == 0.) & (p < 1e-4),
+            MathConsts.M_SQRT2PI * p * (1.0 + np.pi * p**2 / 12.),
+            self.d1sigma(spst.norm.ppf(p*(kk+p)/(2*p+(kk-1.))), logk)  # Lower bound from the paper
+        )
+
+        log_p_2pi = np.log(p) + MathConsts.M_LN2PI_2  # 0.5*np.log(2*np.pi)
+
+        for k in range(n_iter):
+            p2v = self.price_vega_std(sigma, logk)  # pf.Bsm.price_vega_ratio
+            d1 = np.where(logk == 0., 0., -logk/sigma) + 0.5*sigma
+            p_log_err = -0.5*d1**2 + np.log(p2v) - log_p_2pi
+            p_log_err_max = np.amax(np.abs(p_log_err))
+            if p_log_err_max < Bsm.IMPVOL_TOL:
+                break
+            sigma -= p_log_err * p2v
+
+        if p_log_err_max >= Bsm.IMPVOL_TOL:
+            warn_msg = f"impvol_newton did not converged within {k} iterations: max error = {p_log_err_max}"
+            warnings.warn(warn_msg, Warning)
+
+        sigma /= np.sqrt(texp)
+
+        if sigma.ndim == 0:
+            sigma = sigma.item()
+
+        if setval:
+            self.sigma = sigma
+
+        return sigma
+
+    impvol = impvol_log
+
+    def vol_smile(self, strike, spot, texp, cp=1, model="bsm"):
         """
         Equivalent volatility smile for a given model
 
@@ -272,14 +454,17 @@ class Bsm(opt.OptAnalyticABC):
             spot: spot price
             texp: time to expiry
             cp: 1/-1 for call/put option
-            model: {'norm' (default), 'norm-approx', 'norm-grunspan', 'bsm'}
+            model: {'bsm' (default), 'norm-approx', 'norm-grunspan', 'norm'}
 
         Returns:
             volatility smile under the specified model
         """
         if model.lower() == "bsm":
-            return self.sigma*np.ones_like(strike + spot + texp + cp)
+            return self.sigma * np.ones_like(strike) * np.ones_like(spot) * np.ones_like(texp) * np.ones_like(cp)
         if model.lower() == "norm":
+            if cp is None:
+                fwd = self.forward(spot, texp)
+                cp = np.where(strike > fwd, 1, -1)  # make option out-of-the-money
             price = self.price(strike, spot, texp, cp=cp)
             return norm.Norm(None).impvol(price, strike, spot, texp, cp=cp)
         elif model.lower() == "norm-approx" or model.lower() == "norm-grunspan":
@@ -287,21 +472,11 @@ class Bsm(opt.OptAnalyticABC):
             kk = strike/fwd
             lnk = np.log(kk)
             if model.lower() == "norm-approx":
-                return (
-                        self.sigma
-                        *fwd
-                        *np.sqrt(kk)
-                        *(1 + lnk**2/24)
-                        /(1 + self.sigma**2*texp/24)
-                )
+                return self.sigma * fwd * np.sqrt(kk) * (1 + lnk**2/24) / (1 + self.sigma**2*texp/24)
             else:
                 with np.errstate(divide="ignore", invalid="ignore"):
                     term1 = np.where(np.fabs(lnk) > 1e-8, (kk - 1)/lnk, 2/(3 - kk))
-                    term2 = np.where(
-                        np.fabs(lnk) > 1e-8,
-                        (np.log(term1) - lnk/2)/lnk**2,
-                        1/24,
-                    )
+                    term2 = np.where(np.fabs(lnk) > 1e-8, (np.log(term1) - lnk/2)/lnk**2, 1/24)
                 return self.sigma*fwd*term1*(1 - term2*self.sigma**2*texp)
         else:
             raise ValueError(f"Unknown model: {model}")
@@ -310,12 +485,12 @@ class Bsm(opt.OptAnalyticABC):
         strike2 = strike if strike2 is None else strike2
         fwd, df, _ = self._fwd_factor(spot, texp)
 
-        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).eps)
+        sigma_std = np.maximum(self.sigma*np.sqrt(texp), np.finfo(float).tiny)
         d1 = np.log(fwd/strike2)/sigma_std
         d2 = d1 - 0.5*sigma_std
         d1 += 0.5*sigma_std
 
-        price = fwd*spst.norm.cdf(cp*d1) - strike*spst.norm.cdf(cp*d2)
+        price = fwd*spst.norm._cdf(cp*d1) - strike*spst.norm._cdf(cp*d2)
         price *= cp*df
         return price
 
@@ -396,7 +571,7 @@ class Bsm(opt.OptAnalyticABC):
 
         return p
 
-    def moments_vsk(self, texp=1):
+    def price_vsk(self, texp=1):
         """
         Variance, skewness, and ex-kurtosis. Assume mean=1.
 
@@ -409,16 +584,15 @@ class Bsm(opt.OptAnalyticABC):
         References:
             https://en.wikipedia.org/wiki/Log-normal_distribution
         """
-        ww = np.exp(texp*self.sigma**2)
-        var = ww - 1
-        skew = (ww + 2)*np.sqrt(ww - 1)
-        exkurt = ww**2*(ww*(ww + 2) + 3) - 6  # ww**4 + 2*ww**3 + 3*ww - 6
+        var = np.expm1(texp*self.sigma**2)
+        skew = (var + 3)*np.sqrt(var)
+        exkurt = var*(var*(var*(var + 6) + 12) + 13)  # (1+var)**4 + 2*(1+var)**3 + 3*(1+var) - 6
         return var, skew, exkurt
 
 
 class BsmDisp(smile.OptSmileABC, Bsm):
     """
-    Displaced Black-Scholes-Merton model for option pricing. Displace price,
+    Displaced Black-Scholes-Merton model for option pricing. Displaced price,
 
         D(F_t) = beta*F_t + (1-beta)*A
 
@@ -461,7 +635,7 @@ class BsmDisp(smile.OptSmileABC, Bsm):
 
     @property
     def sigma(self):
-        return self.sigma_disp*self.beta
+        return self.sigma_disp * self.beta
 
     @sigma.setter
     def sigma(self, sigma):
@@ -475,7 +649,7 @@ class BsmDisp(smile.OptSmileABC, Bsm):
             spot: spot (or forward) price
 
         Returns:
-            Displaces spot
+            Displaced spot
         """
         return self.beta*spot + (1 - self.beta)*self.pivot
 
@@ -488,7 +662,7 @@ class BsmDisp(smile.OptSmileABC, Bsm):
             texp: time to expiry
 
         Returns:
-            Displace strike
+            Displaced strike
         """
         return self.beta*strike + (1 - self.beta)*self.forward(self.pivot, texp)
 
@@ -552,13 +726,7 @@ class BsmDisp(smile.OptSmileABC, Bsm):
             kkd = self.disp_strike(strike, texp)/fwdd
             lnkd = np.log(kkd)
             # self.sigma actually means self.beta * self._sigma
-            vol = (
-                    self.sigma_disp
-                    *fwdd
-                    *np.sqrt(kkd)
-                    *(1 + lnkd**2/24)
-                    /(1 + self.sigma**2*texp/24)
-            )
+            vol = self.sigma_disp * fwdd * np.sqrt(kkd) * (1 + lnkd**2/24) / (1 + self.sigma**2*texp/24)
         elif model.lower() == "bsm-approx":
             fwd = self.forward(spot, texp)
             kk = strike/fwd
@@ -570,24 +738,19 @@ class BsmDisp(smile.OptSmileABC, Bsm):
 
             # self.sigma actually means self.beta * self.sigma_disp
             vol = self.sigma_disp*(fwdd/fwd)*np.sqrt(kkd/kk)
-            vol *= (
-                    (1 + lnkd**2/24)
-                    /(1 + lnk**2/24)
-                    *(1 + vol**2*texp/24)
-                    /(1 + self.sigma**2*texp/24)
-            )
+            vol *= (1 + lnkd**2/24) / (1 + lnk**2/24) * (1 + vol**2*texp/24) / (1 + self.sigma**2*texp/24)
         else:
             vol = super().vol_smile(strike, spot, texp, model=model, cp=cp)
 
         return vol
 
-    def price_barrier(self, strike, barrier, spot, *args, **kwargs):
-        return (1/self.beta)*self.bsm_model.price_barrier(
-            self.disp(strike), self.disp(barrier), self.disp(spot), *args, **kwargs
+    def price_barrier(self, strike, barrier, spot, texp, *args, **kwargs):
+        return (1/self.beta)*super().price_barrier(
+            self.disp_strike(strike, texp), self.disp_strike(barrier, texp), self.disp_spot(spot), texp, *args, **kwargs
         )
 
-    def moments_vsk(self, texp=1):
-        rv = super().moments_vsk(self, texp)
+    def price_vsk(self, texp=1):
+        rv = super().price_vsk(self, texp)
         rv[0] /= self.beta
         rv[1] /= self.beta**3
         rv[2] /= self.beta**4

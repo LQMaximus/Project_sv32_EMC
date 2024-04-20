@@ -11,21 +11,23 @@ import os
 import pandas as pd
 import numpy as np
 import scipy.optimize as spop
+from scipy import stats as spst
+from numpy.polynomial.hermite_e import hermeval
 
 from . import opt_smile_abc as smile
 from . import bsm
 from . import norm
 from . import cev
-
+from . import util
 
 class SabrABC(smile.OptSmileABC, abc.ABC):
     vov, beta, rho = 0.0, 1.0, 0.0
     model_type = "SABR"
+    var_process = False
+    #### vol_beta: the beta for the volatility to choose _m_vol. If None (by default) vol_beta = beta
     _base_beta = None
 
-    def __init__(
-        self, sigma, vov=0.0, rho=0.0, beta=1.0, intr=0.0, divr=0.0, is_fwd=False
-    ):
+    def __init__(self, sigma, vov=0.1, rho=0.0, beta=1.0, intr=0.0, divr=0.0, is_fwd=False):
         """
         Args:
             sigma: model volatility at t=0
@@ -49,12 +51,12 @@ class SabrABC(smile.OptSmileABC, abc.ABC):
     def _variables(self, fwd, texp):
         betac = 1.0 - self.beta
         alpha = self.sigma / np.power(fwd, betac)  # if self.beta > 0.0 else self.sigma
-        rho2 = self.rho * self.rho
+        rho2 = self.rho**2
         rhoc = np.sqrt(1.0 - rho2)
         vovn = self.vov * np.sqrt(np.maximum(texp, 1e-64))
         return alpha, betac, rhoc, rho2, vovn
 
-    def _m_base(self, vol, is_fwd=None):
+    def base_model(self, vol):
         """
         Create base model based on _base_beta value: `Norm` for 0, Cev for (0,1), and `Bsm` for 1
         If `_base_beta` is None, use `base` instead.
@@ -64,29 +66,20 @@ class SabrABC(smile.OptSmileABC, abc.ABC):
 
         Returns: model
         """
-        base_beta = self._base_beta or self.beta
-        if is_fwd is None:
-            is_fwd = self.is_fwd
+        base_beta = self.beta if self._base_beta is None else self._base_beta
+
         if np.isclose(base_beta, 1):
-            return bsm.Bsm(vol, intr=self.intr, divr=self.divr, is_fwd=is_fwd)
+            return bsm.Bsm(vol, intr=self.intr, divr=self.divr, is_fwd=self.is_fwd)
         elif np.isclose(base_beta, 0):
-            return norm.Norm(vol, intr=self.intr, divr=self.divr, is_fwd=is_fwd)
+            return norm.Norm(vol, intr=self.intr, divr=self.divr, is_fwd=self.is_fwd)
         else:
-            return cev.Cev(
-                vol, beta=base_beta, intr=self.intr, divr=self.divr, is_fwd=is_fwd
-            )
+            return cev.Cev(vol, beta=base_beta, intr=self.intr, divr=self.divr, is_fwd=self.is_fwd)
 
-    def vol_smile(self, strike, spot, texp, cp=1, model=None):
+    def vol_smile(self, strike, spot, texp, cp=None, model=None):
         if model is None:
-            model = (
-                "norm"
-                if np.isclose(self.beta, 0)
-                else "bsm"
-                if self.beta > 0.0
-                else None
-            )
+            model = "norm" if np.isclose(self.beta, 0) else "bsm"
 
-        return super().vol_smile(strike, spot, texp, cp=1, model=model)
+        return super().vol_smile(strike, spot, texp, cp=cp, model=model)
 
     @classmethod
     def init_benchmark(cls, set_no=None):
@@ -138,51 +131,9 @@ class SabrABC(smile.OptSmileABC, abc.ABC):
 
             return m, df_val, param_dict
 
-
-class SabrVolApproxABC(SabrABC):
-    """
-    Abstract class for SABR models with volatility approximation (asymptotic expansion)
-    """
-
-    approx_order = 1  # order in texp: 0: leading order, 1: first order, -1: reserved for 2/(1+exp(-2*eps)) smoothing
-
     @staticmethod
     def _vv(zz, rho):
         return np.sqrt(1 + zz * (zz + 2 * rho))
-
-    @staticmethod
-    def _int_inv_locvol(strike, beta, fwd=1.0):
-        """
-        (int from F to K x^-beta dx)/(K-F)
-            = 1/(1-beta) * (K^(1-beta) - F^(1-beta))/(K-F)
-            = F^(-beta)/(1-beta) * (k^(1-beta) - 1)/(k-1) where k = K/F
-
-        Args:
-            strike:
-            beta:
-            fwd:
-
-        Returns:
-
-        """
-
-        assert np.isscalar(beta)
-        beta = float(beta)  # np.power complains if power is negative integer
-        betac = 1.0 - beta
-        kk = strike / fwd
-
-        # fall-back indices and values first
-        ind_atm = np.fabs(kk - 1.0) < 1e-6
-        val = 1 - beta / 2 * (kk - 1) * (1 - (1 + beta) / 3 * (kk - 1))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            if abs(betac) < 1e-4:
-                val = np.where(ind_atm, val, np.log(kk) / (kk - 1))
-            else:
-                val = np.where(
-                    ind_atm, val, (np.power(kk, betac) - 1) / betac / (kk - 1)
-                )
-
-        return val
 
     @staticmethod
     def _hh(zz, rho):
@@ -197,25 +148,230 @@ class SabrVolApproxABC(SabrABC):
 
         """
         rho2 = rho * rho
-        # initalization with expansion for for small |zz|
-        xx_zz = 1 - (zz / 2) * (
-            rho - zz * (rho2 - 1 / 3 - (5 * rho2 - 3) / 4 * rho * zz)
-        )
-
-        yy = SabrVolApproxABC._vv(zz, rho)
-        eps = 1e-5
 
         with np.errstate(divide="ignore", invalid="ignore"):  # suppress error for zz=0
-            # replace negative zz
-            xx_zz = np.where(
-                zz > -eps, xx_zz, np.log((1 - rho) / (yy - (zz + rho))) / zz
-            )
-            # replace positive zz
-            xx_zz = np.where(
-                zz < eps, xx_zz, np.log((yy + (zz + rho)) / (1 + rho)) / zz
-            )
+            vv = SabrVolApproxABC._vv(zz, rho)
+            zz_xx = np.where(zz + rho > 0,
+                             zz / np.log((vv + zz + rho) / (1 + rho)),
+                             zz / np.log((1 - rho)/(vv - zz - rho))
+                             )
 
-        return 1.0 / xx_zz
+        # expansion for small |zz|
+        # Series[z/Log[(z + ρ + Sqrt[1 + z^2 + 2 z ρ])/(1 + ρ)], {z, 0, 6}]
+        # 1 + (ρ z)/2 + (1/6 - ρ^2/4) z^2 + 1/24 ρ (6 ρ^2 - 5) z^3 + (-(5 ρ^4)/16 + ρ^2/3 - 17/360) z^4 + 1/480 ρ (210 ρ^4 - 275 ρ^2 + 74) z^5 + O(z^6)
+        # (Taylor series)
+        idx = np.abs(zz) < 1e-3
+        if np.any(idx):
+            zz_xx[idx] = 1 + zz[idx]*(rho/2 + zz[idx]*(1/6 - rho2/4 + rho*(6*rho2 - 5)/24 * zz[idx]))
+
+        return zz_xx
+
+    @staticmethod
+    def cond_avgvar_mnc4(vovn, z, remove_exp=False):
+        """
+        First 2 non-central (raw) momments (e.g., mean and M2) of the conditional average variance:
+
+        int_0^1 exp{2 vovn Z_s - vovn^2 s} ds | Z_1 - (vovn/2) = z
+             conditional on z = log(sigma_T/sigma_0) / (vov*sqrt(T))
+
+        True mean and M2 should be multiplied by sigma_0 and sigma_0^2, respectively.
+        See Appendix B in Choi et al. (2019), Eqs. (B5) and (B6) in Kennedy et al. (2012)
+
+        Args:
+            vovn: vov * sqrt(T)
+            z: log(sigma_T/sigma_0) / (vov*sqrt(T)) = Z_1 - (vovn/2)
+            remove_exp: if True, return without multiplying exp(vovn * z). False by default.
+
+        Returns:
+            Mean, M2, M3, M4
+
+        References:
+            - Choi J, Liu C, Seo BK (2019) Hyperbolic normal stochastic volatility model. J Futures Mark 39:186–204. https://doi.org/10.1002/fut.21967
+            - Kennedy JE, Mitra S, Pham D (2012) On the Approximation of the SABR Model: A Probabilistic Approach. Applied Mathematical Finance 19:553–586. https://doi.org/10.1080/1350486X.2011.646523
+        """
+
+        def m1ftn(vv):
+            assert vv >= 0.0
+            if np.abs(vv) > 0.01:
+                ncdf_diff = spst.norm.cdf(-np.abs(z) + vv) - spst.norm.cdf(-np.abs(z) - vv)
+                m = np.sqrt(np.pi/2) / vv * ncdf_diff * np.exp((z**2 + vv**2)/2)
+            else:
+                ## Alternative evaluation usign Hermite polynomial when vv is very small
+                ### coef = vv^(2n) / (n+1)!  for even n
+                # coef = np.array([1, 0, vv**2/6, 0, vv**4/120, 0, vv**6/5040, 0, vv**8/362880])
+                coef = vv/np.arange(1, 8)  # from 1 to 7
+                coef[0] = 1.0
+                np.cumprod(coef, out=coef)
+                coef[1::2] = 0.0  # zero out even terms
+                m = hermeval(z, coef) * np.exp(vv**2/2)
+
+            return m
+
+        exp = np.exp(vovn * z)
+        cosh = (exp + 1./exp)/2.
+
+        m1f, m2f, m3f, m4f = m1ftn(vovn), m1ftn(2*vovn), m1ftn(3*vovn), m1ftn(4*vovn)
+
+        m1 = m1f
+        m2 = (m2f - m1f*cosh)/vovn**2
+        m3 = (0.75*m3f - 2*m2f*cosh + m1f*(cosh**2 + 0.25))/vovn**4/2
+        m4 = (0.5*m4f - 2.25*m3f*cosh + m2f*(3*cosh**2 + 0.5) - m1f*cosh*(cosh**2 + 0.75))/vovn**6/6
+
+        if not remove_exp:
+            m1 *= exp
+            m2 *= exp**2
+            m3 *= exp**3
+            m4 *= exp**4
+
+        return m1, m2, m3, m4
+
+    @staticmethod
+    def cond_avgvar_displn_params(vovn, z, ratio=1.):
+        """
+        Find the prameters (mu, sigma, ratio) to fit moments
+
+            Y ~ (1 - ratio) * mu + ratio * mu * exp(sigma * Z - sigma^2/2)
+
+        Args:
+            vovn:
+            z:
+            ratio:  ratio for the lognormal distribution. 1.0 by default
+
+        Returns:
+
+        """
+
+        # only ratio cares, so use remove_exp=True
+        m1, mnc2, mnc3, mnc4 = SabrABC.cond_avgvar_mnc4(vovn, z, remove_exp=True)
+
+        vovn2 = vovn**2
+        var = np.where(vovn > 0.01, mnc2 - m1**2, vovn2/3*(1 + (4/15)*vovn2*(z**2 + 4)))
+        # vovn**2/3 is from Wolfram Alpha, but it is consistent with Chen et al
+        # at vovn = 0.01 (z=1.),  3.333787675674493e-05  vs  3.333777777777778e-05
+        var_over_m1sq = var/m1**2
+
+        if ratio is None:
+            s = (mnc3 - 3*m1*mnc2 + 2*m1**3)/(var*np.sqrt(var))
+            sqrt_w_m_1 = 2*np.sinh(np.arccosh(s*s/2 + 1)/6)  # sqrt(w-1)
+            sigma = np.sqrt(np.log1p(sqrt_w_m_1**2))
+            ratio = np.sqrt(var_over_m1sq) / sqrt_w_m_1
+        else:
+            sigma = np.sqrt(np.log1p(var_over_m1sq/ratio**2))
+
+        return m1, sigma, ratio
+
+
+    @staticmethod
+    def avgvar_mnc4(vovn):
+        """
+        First 4 non-central(raw) moments of the normalized average variance:
+        (1/T) \int_0^T e^{2*vov Z_t - vov^2 Z_t} = \int_0^1 e^{2 vovn Z_s - vovn^2 s} ds
+        where vovn = vov*sqrt(T). See p.2 in Choi & Wu (2021).
+
+        The implementation is not stable for very small value of vovn. Use avgvar_mvsk instead.
+        This is used for testing the validity of avgvar_mvsk method.
+
+        Args:
+            vovn: vov * sqrt(texp)
+
+        Returns:
+            np.array([m1, n2, m3, m4])
+
+        References
+            - McGhee WA (2021) An artificial neural network representation of the SABR stochastic volatility model. Journal of Computational Finance
+        """
+        vovn2 = vovn**2
+        ww = np.exp(vovn2)
+        m1 = np.where(vovn2 > 1e-6, (ww - 1)/vovn2, 1 + vovn2/2 * (1 + vovn2/3))
+        m2 = (ww**6 - 6*ww + 5)/15/vovn2**2
+        m3 = (ww**15 - 7*ww**6 + 27*ww - 21)/315/vovn2**3
+        m4 = (5*ww**28 - 44*ww**15 + 182*ww**6 - 572*ww + 429)/45045/vovn2**4
+
+        return np.array([m1, m2, m3, m4])
+
+
+    @staticmethod
+    def avgvar_mvsk(vovn):
+        """
+        mean and variance of the normalized average variance:
+        (1/T) \int_0^T e^{2*vov Z_t - vov^2 Z_t} = \int_0^1 e^{2 vovn Z_s - vovn^2 s} ds
+        where vovn = vov*sqrt(T). See p.2 in Choi & Wu (2021).
+
+        Args:
+            vovn: vov * sqrt(texp)
+
+        Returns:
+            (mean, variance, skewness, ex-kurtosis)
+
+        References
+            - McGhee WA (2021) An artificial neural network representation of the SABR stochastic volatility model. Journal of Computational Finance
+        """
+
+        vovn2 = vovn**2
+        m = util.avg_exp(vovn2)  # [exp(vov2)-1]/vov2
+        ww = m * vovn2 + 1.  # = exp(vov2)
+
+        m2 = (10 + ww*(6 + ww*(3 + ww))) / 15
+        v = m2 * m**3 * vovn2   # * (ww-1)^3
+        # If vov2 -> 0, v = (4/3) vovn^2
+
+        coef = np.array([1, 5, 15, 35, 70, 126, 210, 330, 432, 456, 336])/315  # O(x^10)
+        s = np.sqrt(m) * vovn * np.polyval(coef, ww) / np.power(m2, 1.5)  # skewness
+        # If vov2 -> 0, s = (4/5)*3*sqrt(3)*vov = 2.4*sqrt(3) ~ 4.15692*vov
+
+        # Ex-kurtosis calculation
+        # Factor[-3(-1 + w) ^ 4 + (2(-1 + w) ^ 2(5 - 6 w + w ^ 6))/5 - (4(-1 + w)(-21 + 27 w - 7 w ^ 6 + w ^ 15))/315 + (
+        #            429 - 572 w + 182 w ^ 6 - 44 w ^ 15 + 5 w ^ 28)/45045 - 3(-(-1 + w) ^ 2 + (5 - 6 w + w ^ 6)/15) ^ 2]
+       #((w - 1) ^ 7(25
+        # w ^ 21 + 175 w ^ 20 + 700 w ^ 19 + 2100 w ^ 18 + 5250 w ^ 17 + 11550 w ^ 16 + 23100 w ^ 15 + 42900 w ^ 14 + 75075 w ^ 13 + 125125 w ^ 12 + 200200 w ^ 11 + 309400 w ^ 10 + 461240 w ^ 9 + 660920 w ^ 8 + 907400 w ^ 7 + 1190280 w ^ 6 + 1483482 w ^ 5 + 1735734 w ^ 4 + 1857856 w ^ 3 + 1706848 w ^ 2 + 1246960 w + 583440))/225225
+
+        coef = np.array([25, 175, 700, 2100, 5250, 11550, 23100, 42900, 75075, 125125, 200200,
+                         309400, 461240, 660920, 907400, 1190280, 1483482, 1735734, 1857856,
+                         1706848, 1246960, 583440]) / 225225  # O(x^22)
+        k = m * vovn2 * np.polyval(coef, ww) / m2**2
+        # If vov2 -> 0, k = 368/35*3 vovn^2 ~ 31.542857 vovn^2
+
+        return m, v, s, k
+
+
+class SabrVolApproxABC(SabrABC):
+    """
+    Abstract class for SABR models with volatility approximation (asymptotic expansion)
+    """
+
+    approx_order = 1  # order in texp: 0: leading order, 1: first order, -1: reserved for 2/(1+exp(-2*eps)) smoothing
+
+    @staticmethod
+    def _int_inv_locvol(strike, beta, fwd=1.0):
+        """
+        (int from F to K x^-beta dx)/(K-F)
+            = 1/(1-beta) * (K^(1-beta) - F^(1-beta))/(K-F)
+            = F^(-beta)/(1-beta) * (k^(1-beta) - 1)/(k-1) where k = K/F
+
+        Args:
+            strike: strike price
+            beta: beta
+            fwd: forward price
+
+        Returns:
+            integrated inv local vol
+        """
+
+        assert np.isscalar(beta)
+        beta = float(beta)  # np.power complains if power is negative integer
+        betac = 1.0 - beta
+        kk = np.array(strike / fwd)
+
+        # fall-back indices and values first
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if abs(betac) < 1e-4:
+                val = util.avg_inv(kk - 1)
+            else:
+                ind_atm = np.fabs(kk - 1.0) < 1e-6
+                val = 1 - beta/2*(kk - 1)*(1 - (1 + beta)/3*(kk - 1))
+                val = np.where(ind_atm, val, (np.power(kk, betac) - 1) / betac / (kk - 1))
+
+        return val
 
     @abc.abstractmethod
     def vol_for_price(self, strike, spot, texp):
@@ -234,14 +390,14 @@ class SabrVolApproxABC(SabrABC):
 
     def price(self, strike, spot, texp, cp=1):
         vol = self.vol_for_price(strike, spot, texp)
-        m_vol = self._m_base(vol)
+        m_vol = self.base_model(vol)
         price = m_vol.price(strike, spot, texp, cp=cp)
         return price
 
     def impvol(self, price, strike, spot, texp, cp=1, setval=False):
         model = copy.copy(self)
 
-        vol = self._m_base(None).impvol(price, strike, spot, texp, cp=cp)
+        vol = self.base_model(None).impvol(price, strike, spot, texp, cp=cp)
 
         def iv_func(_sigma):
             model.sigma = _sigma
@@ -253,20 +409,14 @@ class SabrVolApproxABC(SabrABC):
             self.sigma = sigma
         return sigma
 
-    def vol_smile(self, strike, spot, texp, cp=1, model=None):
+    def vol_smile(self, strike, spot, texp, cp=None, model=None):
         if model is None:
-            model = (
-                "norm"
-                if np.isclose(self.beta, 0)
-                else "bsm"
-                if self.beta > 0.0
-                else None
-            )
+            model = "norm" if np.isclose(self.beta, 0) else "bsm"
 
-        vol_beta = self._base_beta or self.beta
-        if (model.lower() == "bsm" and np.isclose(vol_beta, 1)) or (
-            model.lower() == "norm" and np.isclose(vol_beta, 0)
-        ):
+        vol_beta = self.beta if self._base_beta is None else self._base_beta
+
+        if (model.lower() == "bsm" and np.isclose(vol_beta, 1)) \
+                or (model.lower() == "norm" and np.isclose(vol_beta, 0)):
             vol = self.vol_for_price(strike, spot, texp)
         else:
             vol = super().vol_smile(strike, spot, texp, cp=cp, model=model)
@@ -319,15 +469,11 @@ class SabrHagan2002(SabrVolApproxABC):
             vol = 1.0 + texp * (term02 + term11 + term20)
 
         zz = pow_kk * log_kk * self.vov / np.maximum(alpha, np.finfo(float).eps)
-        hh = self._hh(
-            -zz, self.rho
-        )  # note we pass -zz becaues hh(zz) definition is different
+        hh = self._hh(-zz, self.rho)  # note we pass -zz becaues hh(zz) definition is different
         vol *= alpha * hh / pre1  # bsm vol
         return vol
 
-    def calibrate3(
-        self, price_or_vol3, strike3, spot, texp, cp=1, setval=False, is_vol=True
-    ):
+    def calibrate3(self, price_or_vol3, strike3, spot, texp, cp=1, setval=False, is_vol=True):
         """
         Given option prices or implied vols at 3 strikes, compute the sigma, vov, rho to fit the data using `scipy.optimize.root`.
         If prices are given (is_vol=False) convert the prices to vol first.
@@ -349,7 +495,7 @@ class SabrHagan2002(SabrVolApproxABC):
         if is_vol:
             vol3 = price_or_vol3
         else:
-            vol3 = self._m_base(None).impvol(price_or_vol3, strike3, spot, texp, cp=cp)
+            vol3 = self.base_model(None).impvol(price_or_vol3, strike3, spot, texp, cp=cp)
 
         def iv_func(x):
             model.sigma = np.exp(x[0])
@@ -359,50 +505,32 @@ class SabrHagan2002(SabrVolApproxABC):
             return err
 
         sol = spop.root(iv_func, np.array([np.log(vol3[1]), -1, 0.0]))
-        params = {
-            "sigma": np.exp(sol.x[0]),
-            "vov": np.exp(sol.x[1]),
-            "rho": np.tanh(sol.x[2]),
-        }
+        params = {"sigma": np.exp(sol.x[0]), "vov": np.exp(sol.x[1]), "rho": np.tanh(sol.x[2])}
 
         if setval:
-            self.sigma, self.vov, self.rho = (
-                params["sigma"],
-                params["vov"],
-                params["rho"],
-            )
+            self.sigma, self.vov, self.rho = params["sigma"], params["vov"], params["rho"]
 
         return params
 
 
-class SabrNorm(SabrVolApproxABC):
+class SabrNormVolApprox(SabrVolApproxABC):
     """
     Noram SABR model (beta=0) with normal volatility approximation.
 
     Examples:
         >>> import numpy as np
         >>> import pyfeng as pf
-        >>> m = pf.SabrNorm(sigma=2, vov=0.2, rho=-0.3, beta=0.5)
+        >>> m = pf.SabrNormVolApprox(sigma=20, vov=0.8, rho=-0.3)
         >>> m.vol_for_price(np.arange(80, 121, 10), 100, 1.2)
-        array([0.21976016, 0.20922027, 0.200432  , 0.19311113, 0.18703486])
+        array([24.97568842, 22.78062691, 21.1072    , 20.38569729, 20.78963436])
         >>> m.price(np.arange(80, 121, 10), 100, 1.2)
-        array([22.04862858, 14.56226187,  8.74170415,  4.72352155,  2.28891776])
+        array([23.70791426, 15.74437409,  9.22425529,  4.78754361,  2.38004685])
     """
 
     _base_beta = 0  # should not be changed
     is_atmvol = False
 
-    def __init__(
-        self,
-        sigma,
-        vov=0.0,
-        rho=0.0,
-        beta=None,
-        intr=0.0,
-        divr=0.0,
-        is_fwd=False,
-        is_atmvol=False,
-    ):
+    def __init__(self, sigma, vov=0.1, rho=0.0, beta=None, intr=0.0, divr=0.0, is_fwd=False, is_atmvol=False):
         """
         Args:
             sigma: model volatility at t=0
@@ -419,6 +547,29 @@ class SabrNorm(SabrVolApproxABC):
             print(f"Ignoring beta = {beta}...")
         self.is_atmvol = is_atmvol
         super().__init__(sigma, vov, rho, beta=0, intr=intr, divr=divr, is_fwd=is_fwd)
+
+    def price_vsk(self, texp=1):
+        """
+        Variance, skewness, and ex-kurtosis of forward price. Eq. (21) in Choi et al. (2019)
+        It is a special case (lambda=0) of NsvhABC.price_vsk()
+
+        Args:
+            texp: time to expiry
+
+        Returns:
+            (variance, skewness, and ex-kurtosis)
+
+        References:
+            - Choi J, Liu C, Seo BK (2019) Hyperbolic normal stochastic volatility model. J Futures Mark 39:186–204. https://doi.org/10.1002/fut.21967
+        """
+        vovn = self.vov * np.sqrt(texp)
+        m2 = np.expm1(vovn**2)
+        ww = m2 + 1
+
+        skew = self.rho * np.sqrt(m2) * (ww+2)
+        exkurt = m2 * ((4*self.rho**2 + 1)/5 * (ww*(ww*(ww + 3) + 6) + 5) + 1)
+
+        return m2*(self.sigma/self.vov)**2, skew, exkurt
 
     def vol_for_price(self, strike, spot, texp):
         fwd = self.forward(spot, texp)
@@ -451,36 +602,11 @@ class SabrChoiWu2021H(SabrVolApproxABC, smile.MassZeroABC):
         array([22.04897988, 14.56240351,  8.74169054,  4.72340753,  2.28876105])
     """
 
-    def __init__(
-        self,
-        sigma,
-        vov=0.0,
-        rho=0.0,
-        beta=1.0,
-        intr=0.0,
-        divr=0.0,
-        is_fwd=False,
-        vol_beta=None,
-    ):
-        """
-        Args:
-            sigma: model volatility at t=0
-            vov: volatility of volatility
-            rho: correlation between price and volatility
-            beta: elasticity parameter. 1.0 by default
-            intr: interest rate (domestic interest rate)
-            divr: dividend/convenience yield (foreign interest rate)
-            is_fwd: if True, treat `spot` as forward price. False by default.
-            vol_beta: the beta for the volatility to choose _m_vol. If None (by default) vol_beta = beta
-        """
-        self._base_beta = vol_beta
-        super().__init__(sigma, vov, rho, beta, intr, divr, is_fwd)
-
     def vol_for_price(self, strike, spot, texp):
         # fwd, spot, sigma may be either scalar or np.array.
         # texp, vov, rho, beta should be scholar values
 
-        vol_beta = self._base_beta or self.beta
+        vol_beta = self.beta if self._base_beta is None else self._base_beta
         vol_betac = 1.0 - vol_beta
 
         fwd, _, _ = self._fwd_factor(spot, texp)
@@ -490,9 +616,7 @@ class SabrChoiWu2021H(SabrVolApproxABC, smile.MassZeroABC):
 
         vov_over_alpha_safe = self.vov / np.maximum(alpha, np.finfo(float).eps)
         tmp = self._int_inv_locvol(kk, self.beta)
-        qq_ratio = (
-            1.0 if self._base_beta is None else self._int_inv_locvol(kk, vol_beta) / tmp
-        )
+        qq_ratio = 1.0 if self._base_beta is None else self._int_inv_locvol(kk, vol_beta) / tmp
 
         qq = tmp * (kk - 1.0)
         zz = vov_over_alpha_safe * qq  # zeta = (vov/sigma0) q
@@ -502,14 +626,7 @@ class SabrChoiWu2021H(SabrVolApproxABC, smile.MassZeroABC):
 
         # term11: O(alpha*vov)
         # C(k)-C(1)/(k-1). Notice that 1/beta comes from int_inv_locvol
-        term11 = (
-            self.rho
-            * self.beta
-            / 4
-            * self.vov
-            * alpha
-            * self._int_inv_locvol(kk, betac)
-        )
+        term11 = self.rho * self.beta / 4 * self.vov * alpha * self._int_inv_locvol(kk, betac)
 
         # term20: O(alpha^2)
         if np.isclose(self.beta, vol_beta):
@@ -519,13 +636,8 @@ class SabrChoiWu2021H(SabrVolApproxABC, smile.MassZeroABC):
                 ## Override ATM (qq=0)
                 term20 = np.where(
                     np.fabs(qq) < 1e-6,
-                    (np.square(betac) - np.square(vol_betac)) / 24 * np.square(alpha),
-                    (
-                        0.5 * (self.beta - self._base_beta) * np.log(kk)
-                        - np.log(qq_ratio)
-                    )
-                    * np.square(alpha)
-                    / qq,
+                    (betac**2 - vol_betac**2) / 24 * alpha**2,
+                    (0.5*(self.beta - self._base_beta) * np.log(kk) - np.log(qq_ratio)) * alpha**2 / qq,
                 )
         # else:
         #    raise ValueError('Cannot handle this vol_beta different from beta')
@@ -586,7 +698,7 @@ class SabrChoiWu2021P(SabrChoiWu2021H, smile.MassZeroABC):
         # fwd, spot, sigma may be either scalar or np.array.
         # texp, vov, rho, beta should be scholar values
 
-        vol_beta = self._base_beta or self.beta
+        vol_beta = self.beta if self._base_beta is None else self._base_beta
         vol_betac = 1.0 - vol_beta
 
         fwd, _, _ = self._fwd_factor(spot, texp)
@@ -603,18 +715,14 @@ class SabrChoiWu2021P(SabrChoiWu2021H, smile.MassZeroABC):
 
         # qq_ratio = qq_vol_beta / qq_beta
         tmp = self._int_inv_locvol(kk, self.beta)
-        qq_ratio = (
-            1.0 if self._base_beta is None else self._int_inv_locvol(kk, vol_beta) / tmp
-        )
+        qq_ratio = 1.0 if self._base_beta is None else self._int_inv_locvol(kk, vol_beta) / tmp
 
         zz = vov_over_alpha_safe * tmp * (kk - 1.0)  # zeta = (vov/sigma0) q
         hh = self._hh(zz, self.rho)
         v_m = self._vv(zz, self.rho)
 
         if abs(betac) < 0.001:
-            gg_diff = (
-                0.5 * self.beta * self.rho / (1.0 - rho2) * (v_m - 1.0 - self.rho * zz)
-            )
+            gg_diff = 0.5 * self.beta * self.rho / (1.0 - rho2) * (v_m - 1.0 - self.rho * zz)
         else:
             t1 = (v_m + self.rho + zz) / rhoc  # array
             t2 = (1 + self.rho) / rhoc  # scalar
@@ -681,7 +789,7 @@ class SabrChoiWu2021P(SabrChoiWu2021H, smile.MassZeroABC):
 
             gg_diff = self.rho * self.beta / (rhoc * betac) * (gg2 - gg1)
 
-        zz2_safe = np.maximum(np.square(zz), np.finfo(float).eps)
+        zz2_safe = np.maximum(zz**2, np.finfo(float).eps)
 
         if np.isclose(self.beta, vol_beta):
             tmp = 0.0
@@ -697,19 +805,12 @@ class SabrChoiWu2021P(SabrChoiWu2021H, smile.MassZeroABC):
                 (0.5 * (self.beta - self._base_beta) * np.log(kk) - np.log(qq_ratio)) * np.square(alpha) / qq
             )
         """
-        order1 = (
-            np.square(self.vov * hh)
-            / zz2_safe
-            * (tmp + 0.5 * np.log(v_m / np.square(hh)) + gg_diff)
-        )
+        order1 = (self.vov * hh)**2 / zz2_safe * (tmp + 0.5 * np.log(v_m / np.square(hh)) + gg_diff)
 
         ## Override ATM (z=0)
         ind_atm = abs(zz) < 1e-6
-        order1[ind_atm] = (
-            np.square(betac) - np.square(vol_betac)
-        ) / 24 * alpha * alpha + (
-            (self.rho * self.beta / 4) * alpha + (2 - 3 * rho2) / 24 * self.vov
-        ) * self.vov  # RHS scalar
+        order1[ind_atm] = (betac**2 - vol_betac**2)/24 * alpha**2 \
+                          + ((self.rho * self.beta / 4) * alpha + (2 - 3 * rho2) / 24 * self.vov) * self.vov  # RHS scalar
 
         # return value
         if self.approx_order == 0:
