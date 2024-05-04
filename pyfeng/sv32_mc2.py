@@ -124,7 +124,7 @@ class Sv32McABC(sv.SvABC, sv.CondMcBsmABC, abc.ABC):
             var = d2_nu_bb * d1 - d1_nu_bb**2 * spsp.polygamma(1, eta + nu + 1)
             d1 *= -d1_nu_bb
 
-        var[var < 0] = 1e-64
+        var[var < 0] = 1e-16
         return d1, var
 
     def cond_spot_sigma(self, texp, var_0):
@@ -189,7 +189,7 @@ class Sv32McTimeStep(Sv32McABC):
             var_t += 0.75 * self.vov**2 * var_0 * (zz**2 - 1.0) * dt
 
         var_t *= var_0
-        var_t[var_t < 0] = 0  # variance should be larger than zero
+        var_t[var_t < 0] = 1e-16  # variance should be larger than zero
 
         return var_t
 
