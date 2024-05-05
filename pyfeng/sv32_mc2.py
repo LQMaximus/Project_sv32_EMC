@@ -242,18 +242,6 @@ class Sv32McBaldeaux2012Exact(Sv32McABC):
             dt: time step
             var_0, var_t: squared volatility at time 0, time t
         """
-        # 下面注释部分为原来的代码，运行正常，但是发现与原文不符
-        # vov2dt = self.vov**2 * dt
-        # phi, _ = self._m_heston.phi_exp(dt)
-        # nu = self._m_heston.chi_dim()/2 - 1
-        # nu_bb = np.sqrt(nu**2 + 8*bb/vov2dt)
-        # zz = phi / np.sqrt(var_0 * var_t)
-
-        # if eta is None:
-        #     ret = self.iv_complex(nu_bb, zz) / spsp.iv(nu, zz)
-        # else:
-        #     nu_diff = 8*bb / self.vov**2 / (nu_bb + nu)
-        #     ret = spsp.gamma(eta + nu + 1) / spsp.gamma(eta + nu_bb + 1) * np.power(zz/2, nu_diff)
 
         vov2dt = self.vov**2 * dt
         phi, _ = self._m_heston.phi_exp(dt)
@@ -290,6 +278,8 @@ class Sv32McBaldeaux2012Exact(Sv32McABC):
         val_dn = laplace_cond(-eps)
         m1 = (val_dn - val_up) / (2 * eps)
         var = (val_dn + val_up - 2.0) / eps**2 - m1**2
+        # m1 = derivative(laplace_cond, 0, n=1, dx=1e-5)
+        # var = derivative(laplace_cond, 0, n=2, dx=1e-5) - m1**2
         ln_sig = np.sqrt(np.log(1 + var / m1**2))
 
         u_error = m1 + 5 * np.sqrt(np.fmax(var, 0))
@@ -400,57 +390,110 @@ class Sv32McChoiKwok2023Ig(Sv32McBaldeaux2012Exact):
         def cumgenfunc_cond(bb):
             return np.log(self.cond_avgvar_laplace(-bb, dt, var_0, var_t))
 
-        m1 = derivative(cumgenfunc_cond, 0, n=1, dx=1e-3)
-        var = derivative(cumgenfunc_cond, 0, n=2, dx=1e-3)
+        m1 = derivative(cumgenfunc_cond, 0, n=1, dx=1e-8)
+        var = derivative(cumgenfunc_cond, 0, n=2, dx=1e-8)
         return m1, var
 
-    # I don't know what does this method means.
-    # def cond_states_step_invlap(self, var_0, texp):
-    #     """
-    #     Sample variance at maturity and conditional integrated variance
+    def cond_avgvar_mv_analytic(self, dt, var_0, var_t):
+        """
+        Warn: not exact still
+        Mean and variance of the average variance conditional on initial var, final var.
+        It is computed from the analytical method in Low-bias simulation scheme for the Heston model by IG approximation(2013).
 
-    #     Args:
-    #         texp: float, time to maturity
-    #     Returns:
-    #         tuple, variance at maturity and conditional integrated variance
-    #     """
+        Args:
+            var_0: initial variance
+            var_t: final variance
+            dt: time step
 
-    #     var_t, eta = self._m_heston.var_step_pois_gamma(texp, 1 / var_0)
-    #     # var_t = self._m_heston.var_step_ncx2(1/var_0, dt)
-    #     np.divide(1.0, var_t, out=var_t)
-    #     # print('eta', eta.min(), eta.mean(), eta.max())
+        Returns:
+            mean, variance
 
-    #     def laplace_cond(bb):
-    #         return self.cond_avgvar_laplace(bb, texp, var_0, var_t, eta)
+        See Also:
+            cond_avgvar_mv
+        """
+        var_0 = 1 / var_0
+        mr = self.mr * self.theta
+        theta = (self.mr + self.vov**2) / mr
+        C1 = np.cosh(mr * dt / 2) / np.sinh(mr * dt / 2)
+        C2 = 1 / np.sinh(mr * dt / 2)
+        delta = 4 * mr * theta / self.vov**2
+        v = delta / 2 - 1
+        Cz = 2 * mr / (self.vov**2 * np.sinh(mr * dt / 2))
+        z = Cz * np.sqrt(var_0 * var_t)
+        mean_X1 = (var_0 + var_t) * (C1 / mr - dt * C2 / 2)
+        sigma2_X1 = (var_0 + var_t) * (
+            self.vov**2 * C1 / (mr**3)
+            + self.vov**2 * dt * C2 / (2 * mr**2)
+            - self.vov**2 * dt**2 * C1 * C2 / (2 * mr)
+        )
+        mean_X2 = delta * self.vov**2 * (-2 + mr * dt * C1) / (4 * mr**2)
+        sigma2_X2 = (
+            delta
+            * self.vov**4
+            * (-8 + 2 * mr * dt * C1 + mr**2 * dt**2 * C2)
+            / (8 * mr**4)
+        )
+        mean_Z = 4 * mean_X2 / delta
+        sigma2_Z = 4 * sigma2_X2 / delta
+        mean_eta = z * self.iv_complex(v + 1, z) / (2 * self.iv_complex(v, z))
+        mean_eta2 = (z**2 * self.iv_complex(v + 2, z)) / (
+            4 * self.iv_complex(v, z)
+        ) + mean_eta
+        m1 = mean_X1 + mean_X2 + mean_eta * mean_Z
+        var = (
+            sigma2_X1
+            + sigma2_X2
+            + mean_eta * sigma2_Z
+            + (mean_eta2 - mean_eta**2) * mean_Z**2
+        )
+        return m1, var
 
-    #     eps = 1e-5
-    #     val_up = laplace_cond(eps)
-    #     val_dn = laplace_cond(-eps)
-    #     m1 = (val_dn - val_up) / (2*eps)
-    #     var = (val_dn + val_up - 2.0)/eps**2 - m1**2
-    #     # print('m1', np.amin(m1), np.amax(m1))
-    #     # print('var', np.amin(var), np.amax(var), (var<0).mean())
-    #     std = np.sqrt(np.fmax(var, 0))
-    #     u_error = np.fmax(m1, 1e-6) + 5 * std
-    #     h = np.pi / u_error
-    #     # print('h', (h<0).sum())
-    #     N = 60
+    def cond_states_step_invlap(self, var_0, texp):
+        """
+        Sample variance at maturity and conditional integrated variance using Laplace transform
 
-    #     # Store the value of characteristic function for each term in the summation when approximating the CDF
-    #     jj = np.arange(1, N + 1)[:, None]
-    #     phimat = laplace_cond(-1j * jj * h).real
+        Args:
+            texp: float, time to maturity
+        Returns:
+            tuple, variance at maturity and conditional integrated variance
+        """
 
-    #     # Sample the conditional integrated variance by inverse transform sampling
-    #     zz = self.rv_normal(spawn=0)
-    #     uu = spst.norm.cdf(zz)
+        # var_t, eta = self._m_heston.var_step_pois_gamma(texp, 1 / var_0)
+        var_t = self._m_heston.var_step_ncx2(1 / var_0, dt)
+        np.divide(1.0, var_t, out=var_t)
+        # print('eta', eta.min(), eta.mean(), eta.max())
 
-    #     def root(xx):
-    #         h_xx = h * xx
-    #         rv = h_xx + 2*(phimat * np.sin(h_xx * jj) / jj).sum(axis=0) - uu * np.pi
-    #         return rv
+        def laplace_cond(bb):
+            return self.cond_avgvar_laplace(bb, texp, var_0, var_t, eta)
 
-    #     avgvar = spop.newton(root, m1)
-    #     return var_t, avgvar
+        eps = 1e-5
+        val_up = laplace_cond(eps)
+        val_dn = laplace_cond(-eps)
+        m1 = (val_dn - val_up) / (2 * eps)
+        var = (val_dn + val_up - 2.0) / eps**2 - m1**2
+        # print('m1', np.amin(m1), np.amax(m1))
+        # print('var', np.amin(var), np.amax(var), (var<0).mean())
+        std = np.sqrt(np.fmax(var, 0))
+        u_error = np.fmax(m1, 1e-6) + 5 * std
+        h = np.pi / u_error
+        # print('h', (h<0).sum())
+        N = 60
+
+        # Store the value of characteristic function for each term in the summation when approximating the CDF
+        jj = np.arange(1, N + 1)[:, None]
+        phimat = laplace_cond(-1j * jj * h).real
+
+        # Sample the conditional integrated variance by inverse transform sampling
+        zz = self.rv_normal(spawn=0)
+        uu = spst.norm.cdf(zz)
+
+        def root(xx):
+            h_xx = h * xx
+            rv = h_xx + 2 * (phimat * np.sin(h_xx * jj) / jj).sum(axis=0) - uu * np.pi
+            return rv
+
+        avgvar = spop.newton(root, m1)
+        return var_t, avgvar
 
     def cond_states_step(self, dt, var_0):
         """
@@ -471,6 +514,7 @@ class Sv32McChoiKwok2023Ig(Sv32McBaldeaux2012Exact):
 
         np.divide(1.0, var_t, out=var_t)
         m1, var = self.cond_avgvar_mv_numeric(dt, var_0, var_t)
+        # m1, var = self.cond_avgvar_mv_analytic(dt, var_0, var_t)
         avgvar = self.draw_from_mv(m1, var, self.dist)
         # var_t, avgvar = self.cond_states_step_invlap(var_0, dt)
 

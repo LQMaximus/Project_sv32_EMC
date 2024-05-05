@@ -71,6 +71,14 @@ iv_exact * 100
 # print(bias)
 
 
+# # Pricing with Exact Simulation
+# m1 = pfex.Sv32McBaldeaux2012Exact(sigma, vov, rho, mr, theta, intr)
+# m1.set_num_params(n_path=10000, rn_seed=123456, dt=None)
+# m1.correct_fwd = False
+# bias = m1.price(strike, spot, texp) - p_exact
+# print(bias)
+
+
 # Pricing with IG approximation (Almost Exact Simulation)
 m2 = pfex.Sv32McChoiKwok2023Ig(sigma, vov, rho, mr, theta, intr)
 m2.set_num_params(n_path=100000, rn_seed=123456, dt=None)
